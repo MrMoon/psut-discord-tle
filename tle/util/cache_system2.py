@@ -16,7 +16,7 @@ from tle.util.ranklist import Ranklist
 logger = logging.getLogger(__name__)
 _CONTESTS_PER_BATCH_IN_CACHE_UPDATES = 100
 CONTEST_BLACKLIST = {1308, 1309, 1431, 1432}
-_DIV_TAGS = ['div1', 'div2', 'div3', 'div4', 'edu']
+_DIV_TAGS = ['div1', 'div2', 'div3', 'edu']
 
 def _is_blacklisted(contest):
     return contest.id in CONTEST_BLACKLIST
@@ -402,8 +402,8 @@ class RatingChangesCache:
         # since _fetch now auto-saves during the process.
         self.cache_master.conn.clear_rating_changes(contest_id=contest_id)
         
-        changes = await self._fetch([contest], auto_save=True)
-        return len(changes)
+        changes_count = await self._fetch([contest], auto_save=True)
+        return changes_count
 
     async def fetch_all_contests(self):
         """Fetch rating changes for all contests. Intended for manual trigger."""
@@ -418,9 +418,8 @@ class RatingChangesCache:
             contest for contest in contests if not self.has_rating_changes_saved(contest.id)]
         total_changes = 0
         for contests_chunk in paginator.chunkify(contests, _CONTESTS_PER_BATCH_IN_CACHE_UPDATES):
-            # _fetch auto_saves by default now, so we don't call self._save_changes(contests_chunk)
-            fetched_chunk = await self._fetch(contests_chunk, auto_save=True)
-            total_changes += len(fetched_chunk)
+            changes_count = await self._fetch(contests_chunk, auto_save=True)
+            total_changes += changes_count
         return total_changes
 
     def is_newly_finished_without_rating_changes(self, contest):
@@ -490,49 +489,61 @@ class RatingChangesCache:
                                          rating_changes=changes)
 
     async def _fetch(self, contests, auto_save=True):
-        all_changes = []
-        batch = []
-        BATCH_SIZE = 1 # Lowered to 1 to prevent massive blocking writes
+        saved_pairs = []
+        total_changes_fetched = 0
 
         for contest in contests:
             try:
                 changes = await cf.contest.ratingChanges(contest_id=contest.id)
                 self.logger.info(f'{len(changes)} rating changes fetched for contest {contest.id}')
                 if changes:
+                    total_changes_fetched += len(changes)
                     pair = (contest, changes)
-                    all_changes.append(pair)
 
                     # Trigger batched saving if enabled
                     if auto_save:
-                        batch.append(pair)
-                        if len(batch) >= BATCH_SIZE:
-                            # Save without rebuilding the entire dictionary cache yet
-                            await self._save_changes(batch, refresh_cache=False)
-                            batch = []
-                            # Yield explicitly so Discord can send its heartbeat
-                            await asyncio.sleep(0.1)
+                        # Save without rebuilding the entire dictionary cache yet
+                        await self._save_changes([pair], refresh_cache=False)
+                        
+                        # EXPLICITLY free the memory immediately to prevent OOM
+                        # This ensures the 40k+ changes are garbage collected instantly
+                        del changes
+                        del pair
+                        
+                        # Yield explicitly so Discord can send its heartbeat
+                        await asyncio.sleep(0.1)
+                    else:
+                        # Only keep in memory if auto_save is False (for live monitoring)
+                        saved_pairs.append(pair)
 
             except cf.CodeforcesApiError as er:
                 self.logger.warning(f'Fetch rating changes failed for contest {contest.id}, ignoring. {er!r}')
                 pass
         
         if auto_save:
-            # Save any final remaining partial batch
-            if batch:
-                await self._save_changes(batch, refresh_cache=False)
-            
             # Rebuild the dictionary ONCE at the very end
             await self._refresh_handle_cache()
+            return total_changes_fetched
 
-        return all_changes
+        return saved_pairs
 
     async def _save_changes(self, contest_changes_pairs, refresh_cache=True):
         flattened = [change for _, changes in contest_changes_pairs for change in changes]
         if not flattened:
             return
             
-        rc = self.cache_master.conn.save_rating_changes(flattened)
-        self.logger.info(f'Saved {rc} changes to database.')
+        total_rc = 0
+        # Split massive arrays of rating changes into manageable chunks
+        CHANGES_BATCH_SIZE = 2500
+        
+        for i in range(0, len(flattened), CHANGES_BATCH_SIZE):
+            chunk = flattened[i:i + CHANGES_BATCH_SIZE]
+            rc = self.cache_master.conn.save_rating_changes(chunk)
+            total_rc += rc
+            # Yield to the event loop to prevent Discord heartbeat blocks
+            await asyncio.sleep(0.1)
+            
+        self.logger.info(f'Saved {total_rc} changes to database.')
         
         if refresh_cache:
             await self._refresh_handle_cache()

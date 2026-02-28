@@ -388,7 +388,7 @@ class RatingChangesCache:
         self.logger = logging.getLogger(self.__class__.__name__)
 
     async def run(self):
-        self._refresh_handle_cache()
+        await self._refresh_handle_cache()
         if not self.handle_rating_cache:
             self.logger.warning('Rating changes cache on disk is empty. This must be populated '
                                 'manually before use.')
@@ -476,7 +476,7 @@ class RatingChangesCache:
         # Sort by the rating update time of the first change in the list of changes, assuming
         # every change in the list has the same time.
         contest_changes_pairs.sort(key=lambda pair: pair[1][0].ratingUpdateTimeSeconds)
-        self._save_changes(contest_changes_pairs)
+        await self._save_changes(contest_changes_pairs)
         for contest, changes in contest_changes_pairs:
             cf_common.event_sys.dispatch(events.RatingChangesUpdate, contest=contest,
                                          rating_changes=changes)
@@ -498,7 +498,7 @@ class RatingChangesCache:
                     if auto_save:
                         batch.append(pair)
                         if len(batch) >= BATCH_SIZE:
-                            self._save_changes(batch)
+                            await self._save_changes(batch)
                             batch = []
 
             except cf.CodeforcesApiError as er:
@@ -507,23 +507,30 @@ class RatingChangesCache:
         
         # Save any final remaining partial batch
         if auto_save and batch:
-            self._save_changes(batch)
+            await self._save_changes(batch)
 
         return all_changes
 
-    def _save_changes(self, contest_changes_pairs):
+    async def _save_changes(self, contest_changes_pairs):
         flattened = [change for _, changes in contest_changes_pairs for change in changes]
         if not flattened:
             return
-        rc = self.cache_master.conn.save_rating_changes(flattened)
+            
+        # Offload synchronous database insert to a background thread
+        rc = await asyncio.to_thread(self.cache_master.conn.save_rating_changes, flattened)
         self.logger.info(f'Saved {rc} changes to database.')
-        self._refresh_handle_cache()
+        await self._refresh_handle_cache()
 
-    def _refresh_handle_cache(self):
-        changes = self.cache_master.conn.get_all_rating_changes()
-        handle_rating_cache = {}
-        for change in changes:
-            handle_rating_cache[change.handle] = change.newRating
+    async def _refresh_handle_cache(self):
+        def _build_cache():
+            changes = self.cache_master.conn.get_all_rating_changes()
+            handle_rating_cache = {}
+            for change in changes:
+                handle_rating_cache[change.handle] = change.newRating
+            return handle_rating_cache
+            
+        # Offload synchronous database read and dictionary building to a background thread
+        handle_rating_cache = await asyncio.to_thread(_build_cache)
         self.handle_rating_cache = handle_rating_cache
         self.logger.info(f'Ratings for {len(handle_rating_cache)} handles cached')
 
